@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { loadConfig, zBool, zInt } from '@studysuite/shared/config'
+import { loadConfig, zInt } from '@studysuite/shared/config'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 
@@ -9,18 +9,18 @@ const schema = z.object({
     }),
     scrape: z.object({
         url: z.string().url(),
-        headless: zBool.default(true),
         intervalMs: zInt.positive().default(1_800_000),
-        /** Per-action cap for page loads and selector waits. */
-        timeoutMs: zInt.positive().default(60_000),
-        /** Where failure screenshots are written. */
-        debugDir: z.string().default('./debug'),
+        /** How far back to reconcile, in days. */
+        pastDays: zInt.positive().default(30),
+        /** How far ahead — the planning is usually published a year out. */
+        futureDays: zInt.positive().default(365),
         /**
-         * Only accept group names that already exist in the database. Leave off
-         * for a first run so the planning's groups are discovered, then purge the
-         * bogus rows and turn it on to stop them coming back.
+         * ADE project id — an **academic year**, not a deployment. It changes
+         * every September, so leave it unset: the scraper picks the project
+         * holding the most events in its range, which rolls over on its own.
+         * Pin it only to force a specific year during an incident.
          */
-        strictGroups: zBool.default(false),
+        projectId: zInt.positive().optional(),
     }),
 })
 
@@ -33,11 +33,10 @@ export const config = loadConfig({
     envMap: {
         DATABASE_URL: 'database.url',
         PROSECONSULT_URL: 'scrape.url',
-        HEADLESS: 'scrape.headless',
         SCRAPE_INTERVAL_MS: 'scrape.intervalMs',
-        SCRAPE_TIMEOUT_MS: 'scrape.timeoutMs',
-        SCRAPE_DEBUG_DIR: 'scrape.debugDir',
-        SCRAPE_STRICT_GROUPS: 'scrape.strictGroups',
+        SCRAPE_PAST_DAYS: 'scrape.pastDays',
+        SCRAPE_FUTURE_DAYS: 'scrape.futureDays',
+        SCRAPE_PROJECT_ID: 'scrape.projectId',
     },
 })
 

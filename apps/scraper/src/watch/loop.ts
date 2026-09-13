@@ -1,13 +1,8 @@
-import { createDb, studentGroups } from '@studysuite/db'
+import { createDb } from '@studysuite/db'
 import type { Config } from '../config.js'
-import { scrapeAllWeeks } from '../scrape/scrape-week.js'
+import { scrapePlanning } from '../scrape/scrape-planning.js'
 
 type Db = ReturnType<typeof createDb>
-
-async function loadKnownGroupNames(db: Db): Promise<Set<string>> {
-    const rows = await db.select({ internalName: studentGroups.internalName }).from(studentGroups)
-    return new Set(rows.map((r) => r.internalName))
-}
 
 function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms))
@@ -20,14 +15,15 @@ export async function runWatchLoop(config: Config, db: Db, runOnce = false): Pro
     })
 
     while (true) {
-        const knownGroupNames = await loadKnownGroupNames(db)
         console.log(`[scraper] Starting scrape at ${new Date().toISOString()}`)
 
         try {
-            const result = await scrapeAllWeeks(config, db, knownGroupNames)
+            const result = await scrapePlanning(config, db)
             console.log(
-                `[scraper] Done — ${result.weeks} weeks, added: ${result.added}, removed: ${result.removed}, ` +
-                    `updated: ${result.updated}, moved: ${result.moved}, duration: ${result.durationMs}ms`,
+                `[scraper] Done — ${result.events} events over ${result.weeks} weeks, ` +
+                    `added: ${result.added}, removed: ${result.removed}, ` +
+                    `updated: ${result.updated}, moved: ${result.moved}, ` +
+                    `duration: ${result.durationMs}ms`,
             )
         } catch (err) {
             console.error('[scraper] Error during scrape:', err)

@@ -40,7 +40,7 @@ pnpm -F @studysuite/db db:studio    # open Drizzle Studio
 
 ```
 apps/api      — Hono HTTP server, runs under Bun
-apps/scraper  — Node scraper (Playwright), scrapes Prose Consult
+apps/scraper  — Node scraper (plain HTTP), reads Prose Consult's ADE feed
 apps/web      — Vue 3 + Vuetify SPA, served by Vite
 packages/db      — Drizzle ORM client + schema (shared by api and scraper)
 packages/shared  — Zero-runtime-dep package: Zod schemas, shared types, config loader
@@ -175,51 +175,113 @@ in it.
 
 ## apps/scraper
 
-Scrapes a **Prose Consult** planning page via Playwright.
+Reads a **Prose Consult** planning over plain HTTP. No browser.
+
+The page is an Adesoft **ADE** 6.12 GWT client, but ADE ships an **iCalendar
+export servlet** that takes plain dates, so the whole academic year arrives in
+two requests instead of 59 browser navigations — about 1.5 s against ~105 s, and
+the image no longer carries Chromium.
 
 **Config** (`config.yaml` + env overrides):
 | Env var | Path | Default |
 |---|---|---|
 | `DATABASE_URL` | `database.url` | — |
 | `PROSECONSULT_URL` | `scrape.url` | — |
-| `HEADLESS` | `scrape.headless` | `true` |
 | `SCRAPE_INTERVAL_MS` | `scrape.intervalMs` | `1800000` (30 min) |
-| `SCRAPE_TIMEOUT_MS` | `scrape.timeoutMs` | `60000` (per page action) |
-| `SCRAPE_DEBUG_DIR` | `scrape.debugDir` | `./debug` (failure screenshots) |
-| `SCRAPE_STRICT_GROUPS` | `scrape.strictGroups` | `false` (only accept known group names) |
+| `SCRAPE_PAST_DAYS` | `scrape.pastDays` | `30` |
+| `SCRAPE_FUTURE_DAYS` | `scrape.futureDays` | `365` |
+| `SCRAPE_PROJECT_ID` | `scrape.projectId` | — (resolved per run) |
 
-Run modes: watch loop (default) or `node index.js --once`.
+Run modes: watch loop (default) or `tsx src/index.ts --once`.
 
-**DOM structure** of the Prose Consult page:
+### How it reads the planning
 
-- `#Planning > div` — event wrappers; `.style.left` gives pixel X position used to infer day column
-- `div.labelLegend[style*="top: 20px"]` — day header cells; `.textContent` ends with `dd/mm/yyyy`; `.style.left` values used to compute column width
-- `#x-auto-26` — week navigation container; children have IDs `x-auto-N`
-- `.x-btn-pressed` — currently selected week button
-- `.gwt-PopupPanel` — loading spinner; navigation waits for it to detach
+1. `GET /direct/?data=…` → a `JSESSIONID`. The `data` blob **is** the
+   credential: it encodes server-side which groups the feed covers.
+2. `POST` GWT-RPC `DirectPlanningServiceProxy.login(DirectLoginRequest{data})`
+   → the ADE session `identifier` (`<hex32>w<n>`) and the resource ids.
+   `ade/login.ts` is deliberately literal — the string table and type
+   signatures come from the compiled client. The POST goes to
+   `…/gwtdirectplanning/DirectPlanningServiceProxy`, **not** the module base,
+   which answers 500; and the `data` blob is not a usable `identifier`.
+3. `GET …/plannings/direct_cal.jsp?projectId&identifier&resources&calType=ical&firstDate&lastDate`
+   → RFC 5545 for the range. One merged `resources=` request returns the same
+   UID set as querying each resource separately, so there is no fan-out.
 
-**Event text parsing** (`apps/scraper/src/parser/`):
+`calType` is ignored by the servlet — every value returns the same iCal.
 
-```
-Line 0:         title
-Lines 1..N-2:   rooms / teachers / groups (middle lines)
-Line N-1:       hours  (format: "8h30 - 10h30")
-```
+### `projectId` is an academic year
 
-Middle lines are categorized:
+Not a deployment setting: this install carries project 6 (2023-24) through 9
+(2026-27), and a new one appears every September. **Do not pin it** — a
+hardcoded id goes blind at the rollover and silently keeps serving last year's
+planning. `resolveProjectId` probes 1..20 over the configured range and takes
+the project with the **most** events, highest id winning ties. Taking the
+_first_ project with any events instead, which the reference implementation
+does, breaks on a window spanning two academic years: it matches the older
+project first and stays there.
 
-- **Teacher**: matches `UPPERCASE_LAST   TitleCase_First` (3-space separator after NBSP normalization). Regex: `/^[A-ZÀ-ÖØ-Þ][A-ZÀ-ÖØ-Þ' \-]*   [A-ZÀ-ÖØ-Þ][A-ZÀ-ÖØ-Þ' \-]*$/`
-- **Path line**: contains `/` — building hierarchy, discarded
-- **Room**: lines before the first teacher that are not path lines
-- **Group**: lines after the last teacher that are not path lines
+A run that resolves no project, or gets an empty calendar, **throws rather than
+reconciling**. `applyWeekEvents` deletes whatever a week holds that the scrape
+did not return, so treating "no events" as "everything was cancelled" would
+empty the planning.
 
-The site does not always emit a path line per room. When an event has no teacher,
-the boundary is the last path line, so a trailing room with no path of its own is
-read as a group (this is how `Salle 007` became a student group). With
-`scrape.strictGroups` enabled, only names already in `student_groups` are accepted;
-an unknown name is read as a room instead, since that is what it usually is. Run
-once without it to discover the real groups, purge the bogus rows, then turn it
-on. It is ignored while the table is empty, so a fresh database still bootstraps.
+### Event parsing (`apps/scraper/src/ade/parse.ts`)
+
+The iCal already separates what the DOM ran together:
+
+| `ParsedEvent`           | Source                                                |
+| ----------------------- | ----------------------------------------------------- |
+| `title`                 | `SUMMARY`                                             |
+| `startDate` / `endDate` | `DTSTART` / `DTEND`, real instants → `toWallClock`    |
+| `rooms`                 | `LOCATION`, split on the escaped comma (`K041\,K131`) |
+| `teachers`              | `DESCRIPTION` lines matching the teacher regex        |
+| `groups`                | the other `DESCRIPTION` lines                         |
+
+Teacher lines keep the same `UPPERCASE_LAST   TitleCase_First` shape the page
+showed (3-space separator after NBSP normalisation), so `parser/teacher.ts` is
+reused unchanged. **`DESCRIPTION` lines are trimmed at the ends only** — the
+reference implementation collapses inner whitespace, which destroys that
+separator and turns every teacher into a student group. `parse.test.ts` pins it.
+
+`A valider`, `(Exported …)` and `Transf…` are status lines, not groups.
+
+Two things this drops on purpose:
+
+- **`strictGroups` is gone.** It patched a DOM-only ambiguity: with no teacher
+  line the room/group boundary was the last path line, so a trailing room with
+  no path of its own was read as a group (this is how `Salle 007` became a
+  student group). `LOCATION` and `DESCRIPTION` are separate fields, so the
+  ambiguity cannot arise.
+- **Pixel day inference is gone.** `DTSTART` carries the date, so there is no
+  `left / columnWidth` arithmetic and no column-width probing.
+
+`DESCRIPTION` also lists groups _outside_ the URL's selection — which is how
+`G-Sète` reaches the database although no Sète group is subscribed. Attributing
+groups from the resource ids instead would silently lose those.
+
+### Week iteration
+
+One range is fetched, then bucketed by Monday with the UTC getters (the
+timestamps are wall-clock labels — see [Time](#time-paris-wall-clock-labelled-utc)).
+`applyWeekEvents` runs for **every** Monday in the range, including weeks that
+came back empty: a week whose classes were all cancelled still has rows to
+remove, and it is only reconciled if it is visited. `insertAllChanges` runs once
+at the end, because cross-week move detection compares removals and additions
+from different weeks.
+
+### Colour is not available here
+
+The iCal carries no colour — only `UID SUMMARY SEQUENCE LOCATION LAST-MODIFIED
+DTSTART DTSTAMP DTEND DESCRIPTION CREATED`. The planning page does colour its
+events, and that data is reachable without a browser through
+`DirectPlanningPlanningServiceProxy.method10getTimetable`, which returns the
+rendered payload with per-event foreground and background as RGB triplets
+(verified: 139 events, 28 colours, matching the DOM exactly). It is **per week**
+and its response is an undocumented positional numeric stream, so if colour is
+ever added it should stay an overlay on top of the iCal rather than replacing
+it — an ADE upgrade that shifts the RPC layout should cost colour, not the
+timetable.
 
 ---
 
@@ -623,5 +685,10 @@ check` verifies the chain.
   included. Run `pnpm exec prettier --write <the files you changed>` instead;
   reverting the collateral afterwards is what loses generated content.
 - Cross-week move detection works because `insertAllChanges` sees all weeks' diffs at once. Adding per-week change insertion would regress this.
+- **A scrape that returns nothing must throw, never reconcile.** `applyWeekEvents`
+  deletes what a week holds that the scrape did not return, so an empty fetch
+  reconciled normally would wipe the planning. The scraper therefore fails on an
+  unresolved `projectId` or an empty calendar instead of passing `[]` to every
+  week. Keep that guard ahead of any new fetch path.
 - The push service worker must stay cache-free — see [The push service worker](#the-push-service-worker). Adding Workbox precaching would serve the pre-substitution `__SITE_URL__` build.
 - Never compare `new Date()` with an event timestamp — see [Time](#time-paris-wall-clock-labelled-utc). Use `wallClockNow()` from `@studysuite/shared/time`.
